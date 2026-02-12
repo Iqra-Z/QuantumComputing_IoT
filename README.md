@@ -1,37 +1,35 @@
-Quantum-Inspired Decision Algorithms on Raspberry Pi + Coral EdgeTPU
+#Quantum-Inspired Decision Algorithms on Raspberry Pi + Coral EdgeTPU
 
-Overview
-
+##Overview
 This project demonstrates a real-time computer vision system running on:
-
 -   Raspberry Pi 5
 -   Raspberry Pi Camera (IMX708)
 -   Coral USB EdgeTPU
 
 The system compares:
-
 -   Classical exhaustive decision search O(N)
 -   Quantum-inspired Grover-style search O(√N)
 
-Both approaches run live and print performance metrics for comparison.
+Both approaches run live and print performance metrics for comparison. This is a quantum-inspired algorithm running on classical hardware.
 
-This is a quantum-inspired algorithm running on classical hardware.
+---
 
-Hardware Required
-
+##Hardware Required
 -   Raspberry Pi 5
 -   Raspberry Pi Camera (connected via ribbon cable)
 -   Coral USB EdgeTPU
 -   Raspberry Pi OS (Desktop recommended)
 
-Software Requirements
-
+##Software Requirements
 -   Raspberry Pi OS (Trixie / Bookworm)
 -   Python 3.9 (required for Coral)
 -   EdgeTPU runtime
 
-Step 1 – Install System Dependencies
+---
 
+##How to Run This
+
+###Step 1 – Install System Dependencies
 Run the following commands in terminal:
 
     sudo apt update
@@ -44,7 +42,7 @@ Install EdgeTPU runtime:
     sudo apt update
     sudo apt install -y libedgetpu1-std
 
-Step 2 – Create Coral Python Environment
+###Step 2 – Create Coral Python Environment
 
 Coral requires Python 3.9.
 
@@ -61,7 +59,7 @@ Install required Python packages:
 -   Do NOT install pip OpenCV inside this environment (causes NumPy
     conflicts).
 
-Step 3 – Download Model Files
+###Step 3 – Download Model Files
 
 Place the following files inside a directory such as:
 
@@ -74,7 +72,7 @@ Required files:
 
 Adjust paths in run commands if needed.
 
-Step 4 – Run the System
+###Step 4 – Run the System
 
 You need TWO terminals.
 
@@ -111,7 +109,7 @@ Then run:
 
     python main.py --mode count --model /home/pi/coral_models/model.tflite --labels /home/pi/coral_models/labels.txt --thresh 0.15 --shm capstone_cam --line 0.60 --debug
 
-Behavior:
+##Behavior:
 
 -   Detects vehicles
 -   Tracks object movement
@@ -119,7 +117,7 @@ Behavior:
 -   Displays traffic level
 -   Shows classical vs Grover comparison
 
-Output Metrics
+##Output Metrics
 
 Every second the system prints:
 
@@ -134,7 +132,7 @@ Example output:
 
 CLASSICAL (O(N)) evals=64 GROVER (~√N) evals=8 Speedup: ~7x
 
-How It Works
+##How It Works
 
 1.  Camera captures frame
 2.  EdgeTPU runs object detection
@@ -143,13 +141,13 @@ How It Works
 5.  Grover-style search checks ~8 states
 6.  Results compared live
 
-Important Note
+##Important Note
 
 -   This project does NOT use quantum hardware.
 -   It demonstrates a quantum-inspired decision search pattern
     implemented on embedded hardware.
 
-To Stop
+##To Stop
 
 -   Press ‘q’ in preview window
 -   Press Ctrl + C in inference terminal
