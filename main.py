@@ -1,4 +1,12 @@
-import time, struct, argparse, random, math
+import time
+import struct
+import argparse
+import random
+import math
+import os
+import json
+import datetime
+from collections import deque
 from multiprocessing import shared_memory
 
 import numpy as np
@@ -59,6 +67,7 @@ def grover_style_search(observed: int, seed: int):
     t1 = time.perf_counter()
     return best, best_score, evals, (t1 - t0) * 1000.0
 
+
 # ---------------- Labels ----------------
 def load_labels(path: str):
     labels = {}
@@ -80,6 +89,7 @@ def load_labels(path: str):
 
 def name_of(labels, i: int) -> str:
     return labels.get(i, f"id_{i}")
+
 
 # ---------------- Feature encoding (6-bit observed state) ----------------
 def encode_state_distracted(has_phone, has_person, num_dets, phone_conf):
@@ -106,6 +116,7 @@ def decision_label_distracted(has_person: bool, has_phone: bool, top_object: str
         return "DISTRACTED", top_object.upper()
     return "FOCUSED", "OK"
 
+
 def encode_state_count(num_vehicles, rate_per_min):
     # bits: some vehicles, >=2, >=4, rate>=5/min, rate>=10/min, reserved
     s = 0
@@ -129,6 +140,7 @@ def decision_label_count(state: int):
         return "TRAFFIC_LOW", "SOME_VEHICLES"
     return "NO_TRAFFIC", "NONE"
 
+
 # ---------------- Simple tracker for counting ----------------
 class Track:
     __slots__ = ("id","cx","cy","last_seen","counted")
@@ -139,8 +151,9 @@ class Track:
         self.last_seen = t
         self.counted = False
 
-def dist(a,b,c,d):
-    return math.hypot(a-c, b-d)
+def dist(ax, ay, bx, by):
+    return math.hypot(ax - bx, ay - by)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -151,9 +164,31 @@ def main():
     ap.add_argument("--shm", default="capstone_cam")
     ap.add_argument("--line", type=float, default=0.60, help="counting: horizontal line position (0..1 of height)")
     ap.add_argument("--debug", action="store_true", help="print top classes once/sec")
+
+    # --- stability window ---
+    ap.add_argument("--stable_window", type=int, default=5, help="rolling window majority-vote for stable decision")
+
+    # --- JSON logging options ---
+    ap.add_argument("--log_dir", default="logs", help="directory to write JSONL logs")
+    ap.add_argument("--run_tag", default="", help="optional tag for filename (e.g., run1, testA)")
+    ap.add_argument("--no_log", action="store_true", help="disable JSON logging")
+
     args = ap.parse_args()
 
     labels = load_labels(args.labels) if args.labels else {}
+
+    # rolling stability buffer (distracted mode only)
+    stable_buf = deque(maxlen=max(1, args.stable_window))
+
+    # Setup logging (JSON Lines: one JSON object per second)
+    log_f = None
+    log_path = None
+    if not args.no_log:
+        os.makedirs(args.log_dir, exist_ok=True)
+        tag = args.run_tag.strip() or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(args.log_dir, f"run_{tag}_{args.mode}.jsonl")
+        log_f = open(log_path, "a", encoding="utf-8")
+        print(f"[LOG] Writing JSONL metrics to: {log_path}")
 
     # Attach shared memory from camera producer
     shm = shared_memory.SharedMemory(name=args.shm, create=False)
@@ -171,6 +206,8 @@ def main():
     frames = 0
     infer_sum = 0.0
     infer_n = 0
+    last_pre_ms = 0.0
+    last_frame_age_ms = 0.0
 
     # Counting state
     next_id = 1
@@ -188,10 +225,9 @@ def main():
             last_frame_id = frame_id
             frames += 1
 
-            header_bytes = 8 + 8 + 4 + 4 + 4 + 4
+            header_bytes = 8 + 8 + 4 + 4 + 4 + 4  # 32
             frame_bytes = int(w) * int(h) * int(c)
 
-            # Copy() so we can cleanly close shared memory and avoid buffer errors
             raw = np.frombuffer(buf, dtype=np.uint8, offset=header_bytes, count=frame_bytes).copy()
             frame = raw.reshape((h, w, c))  # RGB
 
@@ -200,6 +236,13 @@ def main():
             img = Image.fromarray(frame).resize((in_w, in_h))
             resized = np.asarray(img)
             t_pre1 = time.perf_counter()
+            last_pre_ms = (t_pre1 - t_pre0) * 1000.0
+
+            # Age of frame from capture timestamp
+            try:
+                last_frame_age_ms = (time.time_ns() - ts_ns) / 1e6
+            except Exception:
+                last_frame_age_ms = 0.0
 
             # TPU inference
             t_inf0 = time.perf_counter()
@@ -241,9 +284,15 @@ def main():
                     vehicles.append((cx, cy))
 
             # -------- mode logic --------
+            top_object = ""
+            extra = ""
+            observed = 0
+            dec = "UNKNOWN"
+            reason = "INIT"
+            dec_raw = "UNKNOWN"  # only used for distracted stability
+
             if args.mode == "distracted":
                 # Pick top non-person object for "reason"
-                top_object = ""
                 if class_counts:
                     items = sorted(class_counts.items(), key=lambda x: -x[1])
                     for cid, cnt in items:
@@ -254,7 +303,20 @@ def main():
                         break
 
                 observed = encode_state_distracted(has_phone, has_person, len(objs), phone_conf)
-                dec, reason = decision_label_distracted(has_person, has_phone, top_object)
+                dec_raw, reason = decision_label_distracted(has_person, has_phone, top_object)
+
+                # ---- stability window (majority vote) ----
+                stable_buf.append(dec_raw)
+                need = (len(stable_buf) // 2) + 1
+                distracted_votes = sum(1 for x in stable_buf if x == "DISTRACTED")
+                unknown_votes = sum(1 for x in stable_buf if x == "UNKNOWN")
+
+                if unknown_votes >= need:
+                    dec = "UNKNOWN"
+                elif distracted_votes >= need:
+                    dec = "DISTRACTED"
+                else:
+                    dec = "FOCUSED"
 
                 if has_phone:
                     extra = f"phone_conf={phone_conf:.2f}"
@@ -304,27 +366,72 @@ def main():
                 dec, reason = decision_label_count(observed)
                 extra = f"vehicles={len(vehicles)} total={total_count} rate={rate}/min"
 
-            # -------- once per second print scoreboard --------
+            # -------- once per second print + JSON log --------
             now = time.time()
             if now - sec_start >= 1.0:
                 avg_inf = infer_sum / max(1, infer_n)
-                frame_age_ms = (time.time_ns() - ts_ns) / 1e6
-                pre_ms = (t_pre1 - t_pre0) * 1000.0
 
                 best_c, score_c, evals_c, lat_c = classical_search(observed)
                 best_g, score_g, evals_g, lat_g = grover_style_search(observed, seed=frame_id)
                 speedup = (lat_c / lat_g) if lat_g > 0 else 0.0
 
+                # Build top classes list (useful for dashboarding)
+                top_classes = []
+                if class_counts:
+                    top = sorted(class_counts.items(), key=lambda x: -x[1])[:6]
+                    for k, v in top:
+                        top_classes.append({"id": int(k), "name": name_of(labels, k), "count": int(v)})
+
+                # JSONL write (one record per second)
+                if log_f is not None:
+                    record = {
+                        "ts_unix": float(now),
+                        "frame_id": int(frame_id),
+                        "mode": args.mode,
+                        "fps": int(frames),
+                        "dets": int(len(objs)),
+                        "decision": dec,
+                        "decision_raw": dec_raw if args.mode == "distracted" else "",
+                        "reason": reason,
+                        "extra": extra,
+                        "frame_age_ms": float(last_frame_age_ms),
+                        "pre_ms": float(last_pre_ms),
+                        "tpu_infer_avg_ms": float(avg_inf),
+                        "has_person": bool(has_person),
+                        "has_phone": bool(has_phone),
+                        "phone_conf": float(phone_conf),
+                        "top_object": top_object,
+                        "top_classes": top_classes,
+                        "classical": {
+                            "evals": int(evals_c),
+                            "decision_ms": float(lat_c),
+                            "best_state": int(best_c),
+                            "score": int(score_c),
+                        },
+                        "grover": {
+                            "evals": int(evals_g),
+                            "decision_ms": float(lat_g),
+                            "best_state": int(best_g),
+                            "score": int(score_g),
+                        },
+                        "speedup": float(speedup),
+                    }
+                    log_f.write(json.dumps(record) + "\n")
+                    log_f.flush()
+
+                # Terminal prints
                 print("\n" + "="*78)
-                print(f"MODE={args.mode.upper():10s} | FPS={frames:2d} | dets={len(objs):2d} | {dec} ({reason}) {extra}")
-                print(f"Capture→Now: {frame_age_ms:7.1f} ms | Pre: {pre_ms:5.2f} ms | TPU infer avg: {avg_inf:5.2f} ms")
+                if args.mode == "distracted":
+                    print(f"MODE=DISTRACTED | FPS={frames:2d} | dets={len(objs):2d} | raw={dec_raw} -> stable={dec} ({reason}) {extra}")
+                else:
+                    print(f"MODE=COUNT      | FPS={frames:2d} | dets={len(objs):2d} | {dec} ({reason}) {extra}")
+                print(f"Capture→Now: {last_frame_age_ms:7.1f} ms | Pre: {last_pre_ms:5.2f} ms | TPU infer avg: {avg_inf:5.2f} ms")
                 print("-"*78)
-                print(f"CLASSICAL (O(N))   evals={evals_c:2d}  decision_ms={lat_c:7.3f}  best_state={best_c:02d}  score={score_c}")
-                print(f"GROVER (~√N)       evals={evals_g:2d}  decision_ms={lat_g:7.3f}  best_state={best_g:02d}  score={score_g}")
+                print(f"CLASSICAL (O(N))   evals={evals_c:2d}  decision_ms={lat_c:7.3f}  best_state={best_c:02d}  score={score_c:2d}")
+                print(f"GROVER (~√N)       evals={evals_g:2d}  decision_ms={lat_g:7.3f}  best_state={best_g:02d}  score={score_g:2d}")
                 print(f"Speedup (decision layer): {speedup:5.2f}x   |   Oracle evals: 64 vs ~8")
                 if args.debug and class_counts:
-                    top = sorted(class_counts.items(), key=lambda x: -x[1])[:6]
-                    top_s = ", ".join([f"{k}:{name_of(labels,k)}({v})" for k,v in top])
+                    top_s = ", ".join([f"{d['id']}:{d['name']}({d['count']})" for d in top_classes])
                     print(f"Top classes: {top_s}")
                 print("="*78)
 
@@ -334,7 +441,13 @@ def main():
                 infer_n = 0
 
     finally:
+        try:
+            if log_f is not None:
+                log_f.close()
+        except Exception:
+            pass
         shm.close()
+
 
 if __name__ == "__main__":
     main()
