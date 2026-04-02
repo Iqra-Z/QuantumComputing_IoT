@@ -15,7 +15,7 @@ import requests
 import cv2
 import numpy as np
 from PIL import Image
-from tflite_runtime.interpreter import Interpreter, load_delegate
+from tflite_runtime.interpreter import Interpreter
 
 # =========================
 # TFLite detection helper (replacement for pycoral detect)
@@ -350,10 +350,10 @@ def bbox_area(bb):
 
 
 def bbox_to_xyxy(bb, w, h):
-    x1 = clamp_int(bb.xmin, 0, w - 1)
-    y1 = clamp_int(bb.ymin, 0, h - 1)
-    x2 = clamp_int(bb.xmax, 0, w - 1)
-    y2 = clamp_int(bb.ymax, 0, h - 1)
+    x1 = clamp_int(bb.xmin * w, 0, w - 1)
+    y1 = clamp_int(bb.ymin * h, 0, h - 1)
+    x2 = clamp_int(bb.xmax * w, 0, w - 1)
+    y2 = clamp_int(bb.ymax * h, 0, h - 1)
     if x2 < x1:
         x1, x2 = x2, x1
     if y2 < y1:
@@ -399,8 +399,8 @@ def detect_faces_in_roi(face_cascade, frame_rgb, roi_box):
     faces = face_cascade.detectMultiScale(
         gray,
         scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(24, 24),
+        minNeighbors=3,
+        minSize=(20, 20),
     )
 
     out = []
@@ -443,8 +443,8 @@ def choose_driver_person(person_objs, frame_rgb, face_cascade, in_w, in_h):
 
     def center_distance(obj):
         bb = obj.bbox
-        ox = (bb.xmin + bb.xmax) / 2
-        oy = (bb.ymin + bb.ymax) / 2
+        ox = (bb.xmin + bb.xmax) / 2 * in_w
+        oy = (bb.ymin + bb.ymax) / 2 * in_h
         return (ox - cx) ** 2 + (oy - cy) ** 2
 
     best_person = min(person_objs, key=center_distance)
@@ -549,7 +549,6 @@ def main():
 
     interpreter = Interpreter(
         model_path=args.model,
-        experimental_delegates=[load_delegate("libedgetpu.so.1")]
 )
 
     interpreter.allocate_tensors()
@@ -683,6 +682,33 @@ def main():
                     in_h,
                 )
 
+                # Full-frame Haar fallback — Bug fix: TFLite SSD often misses a subject
+                # who fills the frame (only head visible). If Haar didn't fire inside
+                # choose_driver_person (either because person_objs was empty or because
+                # the 300×300 squished ROI was too small), run it on the full-resolution
+                # frame where the face has the most pixels and best aspect ratio.
+                if face_cascade is not None and driver_face_box is None:
+                    _fh_img, _fw_img = frame.shape[:2]
+                    _gray_full = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+                    cv2.equalizeHist(_gray_full, _gray_full)
+                    _ff = face_cascade.detectMultiScale(
+                        _gray_full, scaleFactor=1.1, minNeighbors=3, minSize=(40, 40)
+                    )
+                    if len(_ff) > 0:
+                        _fx, _fy, _ffw, _ffh = max(_ff, key=lambda f: f[2] * f[3])
+                        # Scale detected box to in_w×in_h space so downstream helpers
+                        # (build_driver_focus_region, bbox JSON normalization) work as-is.
+                        driver_face_box = (
+                            int(_fx * in_w / _fw_img),
+                            int(_fy * in_h / _fh_img),
+                            int((_fx + _ffw) * in_w / _fw_img),
+                            int((_fy + _ffh) * in_h / _fh_img),
+                        )
+                        driver_face_area = float(
+                            (driver_face_box[2] - driver_face_box[0]) *
+                            (driver_face_box[3] - driver_face_box[1])
+                        )
+
                 if driver_obj is not None:
                     has_person = True
                     driver_box = bbox_to_xyxy(driver_obj.bbox, in_w, in_h)
@@ -690,6 +716,8 @@ def main():
                 if driver_face_box is not None and driver_face_area >= args.face_min_area:
                     has_driver_face = True
                     driver_face_conf = float(driver_face_area)
+                    # Face detected → driver is present even if TFLite missed the body
+                    has_person = True
 
                 if driver_obj is not None:
                     driver_focus_region = build_driver_focus_region(
@@ -698,11 +726,24 @@ def main():
                         in_w,
                         in_h,
                     )
+                elif has_driver_face:
+                    # No TFLite person box but face visible — build focus region from
+                    # the face so phone detection still works in close-up scenarios.
+                    _fx1, _fy1, _fx2, _fy2 = driver_face_box
+                    _fw_f = max(1, _fx2 - _fx1)
+                    _fh_f = max(1, _fy2 - _fy1)
+                    driver_focus_region = expand_box(
+                        _fx1, _fy1, _fx2, _fy2,
+                        pad_x=int(1.4 * _fw_f),
+                        pad_y=int(1.8 * _fh_f),
+                        w=in_w,
+                        h=in_h,
+                    )
 
                 relevant_driver_objs = []
                 relevant_labels = []
 
-                if driver_obj is not None:
+                if driver_focus_region is not None:
                     for obj, nm in candidate_objs:
                         ob = bbox_to_xyxy(obj.bbox, in_w, in_h)
 
@@ -828,6 +869,42 @@ def main():
                 dec_raw = ""
                 extra = f"vehicles={len(vehicles)} total={total_count} rate={rate}/min"
                 dets_for_print = len(vehicles)
+
+            # ── Write latest detections for dashboard video overlay ────────
+            try:
+                _persons = []
+                _objects = []
+                _face = None
+                if args.mode == "distracted":
+                    # All coordinates stored normalized (0–1); stream_runner scales
+                    # to output resolution without needing in_w/in_h.
+                    _persons = [
+                        [o.bbox.xmin, o.bbox.ymin, o.bbox.xmax, o.bbox.ymax]
+                        for o in person_objs
+                    ]
+                    _objects = [
+                        [o.bbox.xmin, o.bbox.ymin, o.bbox.xmax, o.bbox.ymax, nm]
+                        for o, nm in candidate_objs
+                        if nm in PHONE_NAMES
+                    ]
+                    if driver_face_box is not None:
+                        # driver_face_box is in in_w×in_h pixel space — normalize to 0-1
+                        _face = [
+                            driver_face_box[0] / in_w, driver_face_box[1] / in_h,
+                            driver_face_box[2] / in_w, driver_face_box[3] / in_h,
+                        ]
+                with open("latest_detections.tmp", "w") as _f:
+                    json.dump({
+                        "ts":       time.time(),
+                        "decision": dec,
+                        "reason":   reason,
+                        "persons":  _persons,
+                        "objects":  _objects,
+                        "face":     _face,
+                    }, _f)
+                os.replace("latest_detections.tmp", "latest_detections.json")
+            except Exception:
+                pass
 
             now = time.time()
             if now - sec_start >= 1.0:
